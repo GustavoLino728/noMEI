@@ -51,10 +51,10 @@ class PNCPExtractor:
             dict: JSON de resposta da API.
 
         Raises:
-            requests.HTTPError: Se a resposta indicar erro HTTP após retentativas.
-            requests.ConnectionError: Se não houver conectividade com a API.
+            requests.RequestException: Se a requisição falhar após retentativas.
         """
         url = self.settings.BASE_URL + self._ENDPOINT
+
         for attempt in range(1, self.settings.MAX_RETRIES + 1):
             try:
                 response = self.session.get(
@@ -64,16 +64,19 @@ class PNCPExtractor:
                 )
                 response.raise_for_status()
                 return response.json()
+
             except requests.HTTPError as exc:
                 status = exc.response.status_code if exc.response else None
+
                 # Não faz retry para erros de cliente (4xx)
                 if status and 400 <= status < 500:
                     logger.error("Erro de cliente %s ao acessar %s", status, url)
                     raise
+
                 if attempt < self.settings.MAX_RETRIES:
                     wait = self.settings.RETRY_BACKOFF * attempt
                     logger.warning(
-                        "Tentativa %d/%d falhou (%s). Aguardando %.1fs...",
+                        "Tentativa %d/%d falhou (HTTP %s). Aguardando %.1fs...",
                         attempt,
                         self.settings.MAX_RETRIES,
                         status,
@@ -81,8 +84,28 @@ class PNCPExtractor:
                     )
                     time.sleep(wait)
                 else:
+                    logger.error("Falha definitiva após erro HTTP: %s", status)
+                    raise
+
+            except requests.RequestException as exc:
+                if attempt < self.settings.MAX_RETRIES:
+                    wait = self.settings.RETRY_BACKOFF * attempt
+                    logger.warning(
+                        "Tentativa %d/%d falhou (%s). Aguardando %.1fs...",
+                        attempt,
+                        self.settings.MAX_RETRIES,
+                        str(exc),
+                        wait,
+                    )
+                    time.sleep(wait)
+                else:
+                    logger.error(
+                        "Falha definitiva ao acessar API do PNCP: %s",
+                        str(exc),
+                    )
                     raise
         return {}
+
 
     def extract(
         self,

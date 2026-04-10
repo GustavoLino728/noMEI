@@ -7,6 +7,7 @@ retornados pela API, preparando-os para persistência no banco de dados.
 
 import logging
 from datetime import datetime, timezone
+from pydoc import doc
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -71,6 +72,9 @@ class PNCPTransformer:
 
         Returns:
             dict: Documento transformado e enriquecido, pronto para o MongoDB.
+
+        Raises:
+            ValueError: Se o registro não possuir numeroControlePNCP.
         """
         doc = dict(record)
 
@@ -80,20 +84,28 @@ class PNCPTransformer:
                 doc[field] = _parse_date(doc[field])
 
         # 2. Normaliza strings de texto livre
-        for field in ("objetoCompra", "informacaoComplementar", "justificativaPresencial"):
+        for field in (
+            "objetoCompra",
+            "informacaoComplementar",
+            "justificativaPresencial",
+        ):
             if isinstance(doc.get(field), str):
                 doc[field] = doc[field].strip()
 
-        # 3. Normaliza subDocumento orgaoEntidade
+        # 3. Normaliza subdocumento orgaoEntidade
         orgao = doc.get("orgaoEntidade")
         if isinstance(orgao, dict):
             orgao["razaoSocial"] = (orgao.get("razaoSocial") or "").strip().upper()
 
-        # 4. Remove explicitamente campos None de nível raiz para economizar espaço
+        # 4. Remove explicitamente campos None de nível raiz
         doc = {k: v for k, v in doc.items() if v is not None}
 
-        # 5. Usa numeroControlePNCP como chave única de deduplicação
-        doc["_id"] = doc.get("numeroControlePNCP")
+        # 5. Garante chave única obrigatória para deduplicação
+        numero_controle = doc.get("numeroControlePNCP")
+        if not numero_controle:
+            raise ValueError("Registro sem numeroControlePNCP")
+
+        doc["_id"] = numero_controle
 
         # 6. Adiciona metadado de ingestão
         doc["_etl_ingestao_em"] = datetime.now(tz=timezone.utc)
@@ -113,6 +125,7 @@ class PNCPTransformer:
             list[dict]: Lista de documentos transformados.
         """
         transformed = []
+
         for idx, record in enumerate(records):
             try:
                 transformed.append(self.transform(record))
@@ -122,4 +135,5 @@ class PNCPTransformer:
                     idx,
                     record.get("numeroControlePNCP", "desconhecido"),
                 )
+                
         return transformed

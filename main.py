@@ -10,6 +10,7 @@ Exemplo de uso:
 import argparse
 import logging
 import sys
+from datetime import datetime
 
 from config.settings import Settings
 from src.pipeline import ETLPipeline
@@ -27,6 +28,17 @@ def _configure_logging() -> None:
     )
 
 
+def validar_data(data: str) -> str:
+    """Valida que a data está no formato YYYYMMDD."""
+    try:
+        datetime.strptime(data, "%Y%m%d")
+        return data
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "Formato inválido. Use YYYYMMDD."
+        )
+
+
 def _parse_args() -> argparse.Namespace:
     """
     Analisa os argumentos de linha de comando.
@@ -37,23 +49,29 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="ETL — Coleta de Contratações/Propostas do PNCP para MongoDB Atlas"
     )
+
     parser.add_argument(
         "--data-final",
+        type=validar_data,
         default="20260430",
         metavar="YYYYMMDD",
         help="Data final de encerramento de propostas (padrão: 20260430)",
     )
+
     parser.add_argument(
         "--data-inicial",
+        type=validar_data,
         default=None,
         metavar="YYYYMMDD",
         help="Data inicial de encerramento de propostas (opcional)",
     )
+
     parser.add_argument(
         "--uf",
         default=None,
         help="Sigla da UF para filtrar (ex: pe, sp, rj)",
     )
+
     parser.add_argument(
         "--modalidade",
         type=int,
@@ -61,17 +79,20 @@ def _parse_args() -> argparse.Namespace:
         metavar="CODIGO",
         help="Código da modalidade de contratação (ex: 8)",
     )
+
     parser.add_argument(
         "--cnpj",
         default=None,
         help="CNPJ do órgão contratante (somente números)",
     )
+
     parser.add_argument(
         "--municipio-ibge",
         default=None,
         metavar="CODIGO",
         help="Código IBGE do município",
     )
+
     return parser.parse_args()
 
 
