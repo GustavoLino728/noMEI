@@ -1,11 +1,13 @@
 """
 Módulo de carga de dados no MongoDB Atlas.
 
-Responsável por conectar ao cluster, criar índices e persistir os
-documentos transformados usando operações de upsert para idempotência.
+Responsável por conectar ao cluster, criar índices e persistir documentos
+transformados utilizando operações de upsert.
 """
 
 import logging
+import time
+from datetime import datetime, timezone
 from typing import Any
 
 from pymongo import MongoClient, UpdateOne
@@ -21,22 +23,16 @@ class MongoDBLoader:
     """
     Carrega documentos transformados no MongoDB Atlas.
 
-    Utiliza operações ``bulk_write`` com ``upsert`` baseado no campo
-    ``_id`` (numeroControlePNCP), garantindo idempotência nas execuções.
-
-    Attributes:
-        settings (Settings): Configurações da aplicação.
-        _client (MongoClient | None): Cliente MongoDB (criado via context manager).
-        _collection (Collection | None): Coleção alvo.
+    Utiliza operações em lote (bulk_write) com upsert baseado no campo _id,
+    garantindo idempotência e atualização parcial dos dados.
     """
 
     def __init__(self, settings: Settings) -> None:
         """
-        Inicializa o loader com as configurações fornecidas.
+        Inicializa o loader.
 
         Args:
-            settings (Settings): Objeto de configurações com URI do MongoDB, nome do
-                banco e da coleção.
+            settings (Settings): Configurações da aplicação.
         """
         self.settings = settings
         self._client: MongoClient | None = None
@@ -44,12 +40,7 @@ class MongoDBLoader:
 
     def connect(self) -> None:
         """
-        Abre a conexão com o MongoDB Atlas e prepara a coleção.
-
-        Cria os índices necessários caso ainda não existam.
-
-        Raises:
-            ConnectionFailure: Se não for possível conectar ao cluster.
+        Conecta ao MongoDB Atlas e prepara a coleção principal.
         """
         self._client = MongoClient(
             self.settings.MONGODB_URI,
@@ -57,103 +48,163 @@ class MongoDBLoader:
             connectTimeoutMS=10_000,
             socketTimeoutMS=30_000,
         )
-        # Valida conexão imediatamente
+
         try:
             self._client.admin.command("ping")
-            logger.info("Conexão com MongoDB Atlas estabelecida com sucesso.")
+            logger.info("Conexão com MongoDB Atlas estabelecida.")
         except ConnectionFailure:
             logger.error("Falha ao conectar ao MongoDB Atlas.")
             raise
 
         db = self._client[self.settings.MONGODB_DATABASE]
         self._collection = db[self.settings.MONGODB_COLLECTION]
+
         self._ensure_indexes()
 
     def _ensure_indexes(self) -> None:
         """
-        Cria índices na coleção para otimizar consultas frequentes.
-
-        Índices criados (se não existirem):
-        - ``modalidadeId`` — para filtros por modalidade.
-        - ``unidadeOrgao.ufSigla`` — para filtros por UF.
-        - ``dataAberturaProposta`` — para filtros/ordenação por data.
-        - ``situacaoCompraId`` — para filtros por situação.
-
-        Security note: índices são criados com ``background=False`` para garantir
-        consistência na primeira carga.
+        Cria índices para melhorar performance de consulta.
         """
         assert self._collection is not None
-        indexes = [
-            "modalidadeId",
-            "situacaoCompraId",
-        ]
-        for field in indexes:
-            self._collection.create_index(field, background=True)
+
+        self._collection.create_index("modalidadeId", background=True)
+        self._collection.create_index("situacaoCompraId", background=True)
 
         self._collection.create_index(
             [("unidadeOrgao.ufSigla", 1), ("dataAberturaProposta", -1)],
             background=True,
         )
+
         logger.debug("Índices verificados/criados.")
 
     def load_batch(self, documents: list[dict[str, Any]]) -> dict[str, int]:
         """
-        Persiste um lote de documentos no MongoDB usando upsert em bulk.
-
-        A operação é idempotente: documentos com o mesmo ``_id``
-        (numeroControlePNCP) são atualizados em vez de duplicados.
+        Carrega documentos na coleção principal.
 
         Args:
-            documents (list[dict]): Lista de documentos transformados.
+            documents (list): Documentos transformados.
 
         Returns:
-            dict[str, int]: Contagem de operações realizadas com chaves
-                ``inserted``, ``modified`` e ``errors``.
-
-        Raises:
-            RuntimeError: Se ``connect()`` não foi chamado previamente.
+            dict: Estatísticas da operação.
         """
         if self._collection is None:
-            raise RuntimeError("Loader não conectado. Chame connect() antes de load_batch().")
+            raise RuntimeError("Loader não conectado.")
 
         if not documents:
             return {"inserted": 0, "modified": 0, "errors": 0}
 
+        start_time = time.time()
+
+        valid_docs = [doc for doc in documents if "_id" in doc]
+
+        if len(valid_docs) != len(documents):
+            logger.warning(
+                "Ignorados %d documentos sem _id",
+                len(documents) - len(valid_docs),
+            )
+
         operations = [
             UpdateOne(
-                filter={"_id": doc["_id"]},
-                update={"$set": doc},
+                {"_id": doc["_id"]},
+                {
+                    "$set": doc,
+                    "$setOnInsert": {
+                        "_created_at": datetime.now(tz=timezone.utc)
+                    },
+                },
                 upsert=True,
             )
-            for doc in documents
+            for doc in valid_docs
         ]
 
         try:
             result = self._collection.bulk_write(operations, ordered=False)
-            summary = {
+
+            duration = time.time() - start_time
+
+            logger.info(
+                "Batch principal (%d docs) | Inseridos: %d | Atualizados: %d | Tempo: %.2fs",
+                len(valid_docs),
+                result.upserted_count,
+                result.modified_count,
+                duration,
+            )
+
+            return {
                 "inserted": result.upserted_count,
                 "modified": result.modified_count,
                 "errors": 0,
             }
+
         except BulkWriteError as exc:
             erros = len(exc.details.get("writeErrors", []))
-            logger.error("BulkWriteError: %d operação(ões) com falha.", erros)
-            summary = {
+
+            logger.error("BulkWriteError no batch principal: %d erro(s)", erros)
+
+            return {
                 "inserted": exc.details.get("nUpserted", 0),
                 "modified": exc.details.get("nModified", 0),
                 "errors": erros,
             }
 
-        logger.info(
-            "Lote carregado | Inseridos: %d | Atualizados: %d | Erros: %d",
-            summary["inserted"],
-            summary["modified"],
-            summary["errors"],
-        )
-        return summary
+    def load_into_collection(self, documents: list[dict], collection_name: str) -> None:
+        """
+        Carrega documentos em uma coleção específica.
+
+        Args:
+            documents (list): Documentos a serem inseridos.
+            collection_name (str): Nome da coleção destino.
+        """
+        if self._client is None:
+            raise RuntimeError("MongoDB não conectado.")
+
+        if not documents:
+            return
+
+        valid_docs = [doc for doc in documents if "_id" in doc]
+
+        if not valid_docs:
+            return
+
+        db = self._client[self.settings.MONGODB_DATABASE]
+        collection = db[collection_name]
+
+        operations = [
+            UpdateOne(
+                {"_id": doc["_id"]},
+                {
+                    "$set": doc,
+                    "$setOnInsert": {
+                        "_created_at": datetime.now(tz=timezone.utc)
+                    },
+                },
+                upsert=True,
+            )
+            for doc in valid_docs
+        ]
+
+        try:
+            result = collection.bulk_write(operations, ordered=False)
+
+            logger.info(
+                "Collection '%s' (%d docs) | Inseridos: %d | Atualizados: %d",
+                collection_name,
+                len(valid_docs),
+                result.upserted_count,
+                result.modified_count,
+            )
+
+        except BulkWriteError as exc:
+            logger.error(
+                "Erro ao inserir na collection '%s': %s",
+                collection_name,
+                str(exc),
+            )
 
     def close(self) -> None:
-        """Fecha a conexão com o MongoDB e libera recursos."""
+        """
+        Fecha a conexão com o MongoDB.
+        """
         if self._client:
             self._client.close()
             self._client = None
@@ -161,10 +212,14 @@ class MongoDBLoader:
             logger.debug("Conexão MongoDB encerrada.")
 
     def __enter__(self) -> "MongoDBLoader":
-        """Suporte a context manager — conecta ao banco."""
+        """
+        Context manager — abre conexão automaticamente.
+        """
         self.connect()
         return self
 
     def __exit__(self, *_: Any) -> None:
-        """Suporte a context manager — fecha a conexão ao sair do bloco."""
+        """
+        Context manager — fecha conexão automaticamente.
+        """
         self.close()

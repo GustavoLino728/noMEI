@@ -2,17 +2,16 @@
 Módulo de transformação de dados do PNCP.
 
 Responsável por limpar, normalizar e enriquecer os registros brutos
-retornados pela API, preparando-os para persistência no banco de dados.
+retornados pela API, preparando-os para persistência no MongoDB.
 """
 
 import logging
 from datetime import datetime, timezone
-from pydoc import doc
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Campos de data que precisam ser convertidos para objetos datetime
+# Campos de data
 _DATE_FIELDS = (
     "dataAtualizacao",
     "dataInclusao",
@@ -22,7 +21,7 @@ _DATE_FIELDS = (
     "dataAtualizacaoGlobal",
 )
 
-# Formatos de data aceitos pela API
+# Formatos aceitos
 _DATE_FORMATS = (
     "%Y-%m-%dT%H:%M:%S",
     "%Y-%m-%dT%H:%M:%S.%f",
@@ -31,83 +30,95 @@ _DATE_FORMATS = (
 
 
 def _parse_date(value: str | None) -> datetime | None:
-    """
-    Converte uma string de data para objeto datetime com fuso UTC.
-
-    Args:
-        value (str | None): String de data no formato ISO.
-
-    Returns:
-        datetime | None: Objeto datetime (UTC) ou None se inválido/ausente.
-    """
+    """Converte string para datetime UTC."""
     if not value:
         return None
+
     for fmt in _DATE_FORMATS:
         try:
             dt = datetime.strptime(value, fmt)
             return dt.replace(tzinfo=timezone.utc)
         except ValueError:
             continue
+
     logger.warning("Formato de data não reconhecido: '%s'", value)
     return None
 
 
+def _clean_dict(data: dict[str, Any]) -> dict[str, Any]:
+    """
+    Remove valores inválidos do dicionário:
+    - None
+    - strings vazias
+    - listas vazias
+    """
+    return {
+        k: v
+        for k, v in data.items()
+        if v is not None and v != "" and v != []
+    }
+
+
 class PNCPTransformer:
     """
-    Transforma registros brutos da API do PNCP em documentos prontos para persistência.
+    Transforma registros brutos da API do PNCP em documentos limpos para o MongoDB.
 
-    Operações realizadas:
-    - Conversão de campos de data para objetos datetime (UTC).
-    - Remoção de campos nulos desnecessários para reduzir payload.
-    - Adição de metadados de ingestão (``_etl_ingestao_em``).
-    - Normalização de strings (strip de espaços).
+    Operações:
+    - Conversão de datas
+    - Normalização de texto
+    - Limpeza de dados
+    - Definição de chave única (_id)
     """
 
     def transform(self, record: dict[str, Any]) -> dict[str, Any]:
         """
-        Transforma um único registro bruto da API.
+        Transforma um registro bruto.
 
         Args:
-            record (dict): Registro bruto retornado pelo extrator.
+            record (dict): Registro vindo da API.
 
         Returns:
-            dict: Documento transformado e enriquecido, pronto para o MongoDB.
-
-        Raises:
-            ValueError: Se o registro não possuir numeroControlePNCP.
+            dict: Documento pronto para o MongoDB.
         """
+
         doc = dict(record)
 
-        # 1. Converte campos de data para datetime
+        # 1. Converter datas
         for field in _DATE_FIELDS:
             if field in doc:
                 doc[field] = _parse_date(doc[field])
 
-        # 2. Normaliza strings de texto livre
-        for field in (
+        # 2. Normalização de texto
+        text_fields = (
             "objetoCompra",
             "informacaoComplementar",
             "justificativaPresencial",
-        ):
+        )
+
+        for field in text_fields:
             if isinstance(doc.get(field), str):
                 doc[field] = doc[field].strip()
 
-        # 3. Normaliza subdocumento orgaoEntidade
+        # 3. Normalização do órgão
         orgao = doc.get("orgaoEntidade")
         if isinstance(orgao, dict):
-            orgao["razaoSocial"] = (orgao.get("razaoSocial") or "").strip().upper()
+            orgao["razaoSocial"] = (
+                (orgao.get("razaoSocial") or "")
+                .strip()
+                .upper()
+            )
 
-        # 4. Remove explicitamente campos None de nível raiz
-        doc = {k: v for k, v in doc.items() if v is not None}
+        # 4. Limpeza geral
+        doc = _clean_dict(doc)
 
-        # 5. Garante chave única obrigatória para deduplicação
+        # 5. Garantir _id
         numero_controle = doc.get("numeroControlePNCP")
         if not numero_controle:
             raise ValueError("Registro sem numeroControlePNCP")
 
         doc["_id"] = numero_controle
 
-        # 6. Adiciona metadado de ingestão
+        # 6. Metadata ETL
         doc["_etl_ingestao_em"] = datetime.now(tz=timezone.utc)
 
         return doc
@@ -116,14 +127,15 @@ class PNCPTransformer:
         self, records: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
         """
-        Transforma uma lista de registros brutos.
+        Transforma lista de registros.
 
         Args:
-            records (list[dict]): Lista de registros brutos.
+            records (list): Registros brutos.
 
         Returns:
-            list[dict]: Lista de documentos transformados.
+            list: Registros transformados.
         """
+
         transformed = []
 
         for idx, record in enumerate(records):
@@ -131,9 +143,9 @@ class PNCPTransformer:
                 transformed.append(self.transform(record))
             except Exception:
                 logger.exception(
-                    "Erro ao transformar registro %d (numeroControlePNCP=%s). Ignorando.",
+                    "Erro ao transformar registro %d (numeroControlePNCP=%s)",
                     idx,
                     record.get("numeroControlePNCP", "desconhecido"),
                 )
-                
+
         return transformed

@@ -7,6 +7,7 @@ Responsável por realizar requisições HTTP paginadas ao endpoint
 
 import logging
 import time
+from datetime import datetime, timedelta
 from typing import Any, Generator
 
 import requests
@@ -21,10 +22,6 @@ class PNCPExtractor:
     Extrai contratações com recebimento de propostas abertas da API do PNCP.
 
     Suporta paginação automática e retentativas em caso de falhas transitórias.
-
-    Attributes:
-        settings (Settings): Configurações da aplicação.
-        session (requests.Session): Sessão HTTP reutilizável para eficiência de rede.
     """
 
     _ENDPOINT = "/v1/contratacoes/proposta"
@@ -32,49 +29,59 @@ class PNCPExtractor:
     def __init__(self, settings: Settings) -> None:
         """
         Inicializa o extrator com as configurações fornecidas.
-
-        Args:
-            settings (Settings): Objeto de configurações com base_url, timeouts, etc.
         """
         self.settings = settings
         self.session = requests.Session()
-        self.session.headers.update({"Accept": "application/json"})
+        self.session.headers.update({
+            "Accept": "application/json",
+            "User-Agent": "etl-pncp/1.0"
+        })
 
     def _fetch_page(self, params: dict[str, Any]) -> dict[str, Any]:
         """
-        Requisita uma única página da API com retentativas.
-
-        Args:
-            params (dict): Parâmetros de query string da requisição.
-
-        Returns:
-            dict: JSON de resposta da API.
-
-        Raises:
-            requests.RequestException: Se a requisição falhar após retentativas.
+        Requisita uma página da API com suporte a retentativas.
         """
         url = self.settings.BASE_URL + self._ENDPOINT
 
         for attempt in range(1, self.settings.MAX_RETRIES + 1):
             try:
+                start_time = time.time()
+
                 response = self.session.get(
                     url,
                     params=params,
-                    timeout=self.settings.REQUEST_TIMEOUT,
+                    timeout=(5, self.settings.REQUEST_TIMEOUT),
                 )
+
+                duration = time.time() - start_time
+                logger.info("Request concluída em %.2fs", duration)
+
+                logger.debug("Params enviados: %s", params)
+
+                if response.status_code == 422:
+                    logger.error(
+                        "Erro 422 | Params: %s | Response: %s",
+                        params,
+                        response.text[:200],
+                    )
+                    return {"data": [], "totalRegistros": 0}
+
                 response.raise_for_status()
                 return response.json()
 
             except requests.HTTPError as exc:
                 status = exc.response.status_code if exc.response else None
 
-                # Não faz retry para erros de cliente (4xx)
                 if status and 400 <= status < 500:
-                    logger.error("Erro de cliente %s ao acessar %s", status, url)
-                    raise
+                    logger.error(
+                        "Erro de cliente %s | Params: %s",
+                        status,
+                        params,
+                    )
+                    return {"data": [], "totalRegistros": 0}
 
                 if attempt < self.settings.MAX_RETRIES:
-                    wait = self.settings.RETRY_BACKOFF * attempt
+                    wait = self.settings.RETRY_BACKOFF * (2 ** (attempt - 1))
                     logger.warning(
                         "Tentativa %d/%d falhou (HTTP %s). Aguardando %.1fs...",
                         attempt,
@@ -89,7 +96,7 @@ class PNCPExtractor:
 
             except requests.RequestException as exc:
                 if attempt < self.settings.MAX_RETRIES:
-                    wait = self.settings.RETRY_BACKOFF * attempt
+                    wait = self.settings.RETRY_BACKOFF * (2 ** (attempt - 1))
                     logger.warning(
                         "Tentativa %d/%d falhou (%s). Aguardando %.1fs...",
                         attempt,
@@ -104,83 +111,103 @@ class PNCPExtractor:
                         str(exc),
                     )
                     raise
-        return {}
 
+        return {"data": [], "totalRegistros": 0}
 
     def extract(
         self,
         data_final: str,
         data_inicial: str | None = None,
-        uf: str | None = None,
+        uf: str | list[str] | None = None,
         codigo_modalidade: int | None = None,
         cnpj: str | None = None,
         codigo_municipio_ibge: str | None = None,
         codigo_unidade_administrativa: str | None = None,
+        max_paginas: int | None = None,
+        page_size: int | None = None,
     ) -> Generator[dict[str, Any], None, None]:
         """
-        Extrai todos os registros do endpoint de propostas via paginação automática.
-
-        Args:
-            data_final (str): Data final de encerramento de propostas (formato YYYYMMDD). Obrigatório.
-            data_inicial (str | None): Data inicial de encerramento de propostas (formato YYYYMMDD).
-            uf (str | None): Sigla da UF para filtrar resultados.
-            codigo_modalidade (int | None): Código da modalidade de contratação.
-            cnpj (str | None): CNPJ do órgão contratante.
-            codigo_municipio_ibge (str | None): Código IBGE do município.
-            codigo_unidade_administrativa (str | None): Código da unidade administrativa.
-
-        Yields:
-            dict: Registro individual de contratação/proposta (dados brutos da API).
+        Extrai registros do endpoint de propostas do PNCP utilizando paginação automática.
         """
+
+        page_size = page_size or self.settings.PAGE_SIZE
+
+        logger.info(
+            "Configuração: page_size=%s | max_paginas=%s",
+            page_size,
+            max_paginas or "ilimitado",
+        )
+
+        if not data_inicial:
+            fallback = datetime.now() - timedelta(days=2)
+            data_inicial = fallback.strftime("%Y%m%d")
+            logger.warning(
+                "dataInicial não informada — usando fallback: %s",
+                data_inicial,
+            )
+
         params: dict[str, Any] = {
             "dataFinal": data_final,
+            "dataInicial": data_inicial,
             "pagina": 1,
-            "tamanhoPagina": self.settings.PAGE_SIZE,
+            "tamanhoPagina": page_size,
         }
-        if data_inicial:
-            params["dataInicial"] = data_inicial
+
         if uf:
-            params["uf"] = uf
+            if isinstance(uf, list):
+                params["uf"] = ",".join(u.upper() for u in uf)
+            else:
+                params["uf"] = uf.upper()
+
         if codigo_modalidade is not None:
             params["codigoModalidadeContratacao"] = codigo_modalidade
+
         if cnpj:
             params["cnpj"] = cnpj
+
         if codigo_municipio_ibge:
             params["codigoMunicipioIbge"] = codigo_municipio_ibge
+
         if codigo_unidade_administrativa:
             params["codigoUnidadeAdministrativa"] = codigo_unidade_administrativa
 
         total_extraido = 0
+
         while True:
             logger.info("Buscando página %d...", params["pagina"])
-            payload = self._fetch_page(params)
 
-            records: list[dict] = payload.get("data", [])
+            payload = self._fetch_page(params)
+            records = payload.get("data", [])
+
             if not records:
                 logger.info("Nenhum registro retornado. Extração concluída.")
                 break
 
             for record in records:
                 yield record
+
             total_extraido += len(records)
 
-            # Verifica se há próxima página via totalRegistros
             total_registros = payload.get("totalRegistros", 0)
             pagina_atual = params["pagina"]
-            max_paginas = (
-                (total_registros + self.settings.PAGE_SIZE - 1)
-                // self.settings.PAGE_SIZE
-            )
+
+            page_size_used = params["tamanhoPagina"]
+
+            total_paginas = (
+                (total_registros + page_size_used - 1)
+                // page_size_used
+            ) if total_registros else "?"
+
             logger.info(
-                "Página %d/%d | Registros coletados: %d/%d",
+                "Página %d/%s | Registros coletados: %d/%s",
                 pagina_atual,
-                max_paginas if total_registros else "?",
+                total_paginas,
                 total_extraido,
                 total_registros or "?",
             )
 
-            if len(records) < self.settings.PAGE_SIZE:
-                logger.info("Última página atingida. Extração concluída.")
+            if max_paginas and params["pagina"] >= max_paginas:
+                logger.warning("Limite de páginas atingido (%d).", max_paginas)
                 break
 
             if total_registros and total_extraido >= total_registros:
@@ -191,6 +218,6 @@ class PNCPExtractor:
         logger.info("Total de registros extraídos: %d", total_extraido)
 
     def close(self) -> None:
-        """Fecha a sessão HTTP e libera recursos de rede."""
+        """Fecha a sessão HTTP."""
         self.session.close()
         logger.debug("Sessão HTTP encerrada.")
