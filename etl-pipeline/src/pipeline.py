@@ -163,6 +163,12 @@ class ETLPipeline:
 
         for record in buffer:
             try:
+                cnae_codes = self.extractor.fetch_cnae_codes(
+                    record.get("numeroControlePNCP", "")
+                )
+                if cnae_codes:
+                    record["cnae_codes"] = cnae_codes
+
                 doc = self.transformer.transform(record)
                 contratacoes.append(doc)
 

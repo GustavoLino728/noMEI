@@ -74,6 +74,13 @@ class MongoDBLoader:
             [("unidadeOrgao.ufSigla", 1), ("dataAberturaProposta", -1)],
             background=True,
         )
+        self._collection.create_index("_mei_compativel", background=True)
+        self._collection.create_index("valorTotalEstimado", background=True)
+        self._collection.create_index("cnae_codes", background=True)
+        self._collection.create_index(
+            [("objetoCompra", "text")],
+            background=True,
+        )
 
         logger.debug("Índices verificados/criados.")
 

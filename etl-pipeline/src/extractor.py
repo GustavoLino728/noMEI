@@ -217,6 +217,48 @@ class PNCPExtractor:
 
         logger.info("Total de registros extraídos: %d", total_extraido)
 
+    def fetch_cnae_codes(self, numero_controle_pncp: str) -> list[str]:
+        """
+        Busca os códigos CNAE dos itens de uma contratação.
+
+        TODO (data engineer): verificar se o endpoint de itens do PNCP retorna
+        o campo CNAE e confirmar o nome exato do campo na resposta.
+        Endpoint assumido: /v1/orgaos/{cnpj}/compras/{ano}/{sequencial}/itens
+        Base URL assumida: https://pncp.gov.br/api/pncp
+
+        Args:
+            numero_controle_pncp: ex. "07622498000173-1-000008/2026"
+
+        Returns:
+            Lista de códigos CNAE únicos dos itens, ou lista vazia se não disponível.
+        """
+        try:
+            parts = numero_controle_pncp.split("/")
+            ano = parts[1]
+            left = parts[0].split("-")
+            cnpj = left[0]
+            sequencial = int(left[2])
+        except (IndexError, ValueError):
+            logger.warning("numeroControlePNCP inválido: %s", numero_controle_pncp)
+            return []
+
+        url = f"https://pncp.gov.br/api/pncp/v1/orgaos/{cnpj}/compras/{ano}/{sequencial}/itens"
+
+        try:
+            response = self.session.get(url, timeout=(5, self.settings.REQUEST_TIMEOUT))
+            if response.status_code != 200:
+                return []
+            itens = response.json() if isinstance(response.json(), list) else response.json().get("data", [])
+            cnae_codes = list({
+                item["codigoCnae"]
+                for item in itens
+                if item.get("codigoCnae")
+            })
+            return cnae_codes
+        except Exception:
+            logger.warning("Falha ao buscar itens de %s", numero_controle_pncp)
+            return []
+
     def close(self) -> None:
         """Fecha a sessão HTTP."""
         self.session.close()
