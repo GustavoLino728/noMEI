@@ -11,6 +11,8 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+_MEI_VALOR_LIMITE = 144_900.0
+
 # Campos de data
 _DATE_FIELDS = (
     "dataAtualizacao",
@@ -118,7 +120,13 @@ class PNCPTransformer:
 
         doc["_id"] = numero_controle
 
-        # 6. Metadata ETL
+        # 6. Compatibilidade MEI — True se valor está dentro do limite anual
+        valor = doc.get("valorTotalEstimado")
+        doc["_mei_compativel"] = (
+            isinstance(valor, (int, float)) and valor <= _MEI_VALOR_LIMITE
+        )
+
+        # 7. Metadata ETL
         doc["_etl_ingestao_em"] = datetime.now(tz=timezone.utc)
 
         return doc
